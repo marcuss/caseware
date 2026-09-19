@@ -1,0 +1,84 @@
+Staff Java Software Developer 
+Caseware 
+$23.000.000 COP - $26.000.000 COP (Integrales) Permanent contract (indefinido), full-time  |  100% remote 
+About Caseware 
+Caseware is one of Canada's original Fintech companies, having led the global audit and accounting software industry for 
+over 30 years. The company has more than 500,000 users across 130 countries, available in 16 different languages. Over 
+36,000 accounting and audit professionals list Caseware as a skill on their LinkedIn profiles. 
+As a Staff Java Software Developer, you are a professional who combines strong hands-on Java skills with the ability to 
+influence across teams and reduce ambiguity. Architectural decisions and standards are shaped through this role, acting as a 
+technical leader through design reviews and RFCs, and mentoring senior and junior engineers alike. 
+You serve as a core contributor on the platform, with direct impact on the value Caseware delivers to customers and 
+distribution partners globally, owning key features and architectural improvements end -to-end, from design through build, 
+using modern, leading-edge technology and architecture. This role does not include managing a development team directly, 
+since Caseware already has managers for that function. Instead, the focus is on leading projects, driving architectural and 
+technical decisions, and collaborating with developers, product managers, and security teams to move projects forward . 
+Location 
+This is a fully remote position based in Colombia, collaborating with global English speaking teams. 
+Tech Stack 
+• Languages & Frameworks: Java (Java 21 or Java 25 preferred) 
+• Cloud & Infrastructure: AWS (S3, Secrets Manager, Lambda, SQS, SNS, DynamoDB, EKS, etc.), CloudFormation, 
+Terraform. 
+• Data: SQL Server, AWS RDS SQL Server, MongoDB or similar NoSQL databases.  
+• Testing & Observability: New Relic, AWS CloudWatch. 
+• Tooling: Jira, Visual Studio, GitHub, Devin, Claude Code. 
+Core Responsibilities 
+• Define and evolve technical architecture, establishing standards that support safe, scalable, and reusable capabilities 
+across teams. 
+• Act as a technical leader across teams, influencing architectural decisions through design reviews, RFCs, and hands -on 
+collaboration. 
+• Own key features and architectural improvements end-to-end, from design through build, using modern, leading-edge 
+technology and architecture. 
+• Lead software architecture decisions with a particular focus on distributed systems and microservices, keeping 
+scalability as a central design consideration. 
+• Lead proof-of-concepts that inform roadmap and architectural decisions. 
+• Partner with QA, Product, Security, and Domain SMEs to ensure robust observability, reliability, and quality of the 
+systems you own. 
+• Establish and promote engineering standards and best practices to improve consistency, security, and maintainability.  
+• Drive operational excellence by identifying systemic risks and eliminating root causes that impact reliability, 
+performance, or cost. 
+• Partner with DevOps and Security teams to evolve CI/CD pipelines, deployment strategies, and production safeguards.  
+• Mentor senior and junior engineers through code reviews, design discussions, and technical guidance.  
+• Participate in production support as a senior escalation point, leading root cause analysis and driving preventative 
+improvements. 
+• Collaborate with a team of deep technical experience and strong domain knowledge, within an agile team of developers, 
+testers, and a product owner. 
+AI-Augmented Development Expectations 
+• Champion effective, responsible use of AI-assisted development tools across multiple teams. 
+• Define standards and guardrails for how AI-assisted and agentic tooling is used across the SDLC, balancing velocity 
+with correctness, security, and maintainability. 
+• Mentor senior and junior engineers on advanced AI-assisted development practices. 
+Role Requirements 
+• 8+ years of professional software engineering experience, with demonstrated impact beyond a single team.  
+• In-depth, extensive experience with server-side Java, viewed as a subject matter expert on all things Java. 
+• Solid experience designing software architecture in general, with particular strength in distributed architectures and 
+microservices, and a consistent focus on scalability. 
+• Advanced spoken English level. 
+• Experience delivering cloud-native systems on AWS (S3, Secrets Manager, Lambda, SQS, SNS, DynamoDB, EKS, 
+etc.) 
+• Experience working with both monolith applications and microservices. 
+• Good experience with containerization and orchestration (Docker, Kubernetes).  
+• Knowledge of relational databases, such as SQL Server, alongside NoSQL experience.  
+• Solid software engineering fundamentals and the ability to balance delivery speed with long -term platform health. 
+• Proven experience contributing to, and taking ownership of, important architectural decisions.  
+• Experience working in an agile team with other developers, testers, and a product owner.  
+• Strong communication skills and the ability to influence technical direction and align stakeholders around key decisions.  
+• Strong initiative to improve processes, tools, methodologies, and product quality.  
+The strongest candidates for this role combine modern architectural design skills with a solid foundation in Java and 
+communicate well with other stakeholders when architectural decisions need to be made.  
+Hiring Process 
+• Interview with an Alcor recruiter. 
+• Technical take-home challenge. 
+• 15-minute interview with Caseware's HR Team. 
+• Technical interview with a Lead/Manager. 
+Perks & Benefits 
+Salary range: $23.000.000 COP - $26.000.000 COP (Integrales) 
+• Permanent contract (“Contrato a término Indefinido”) with all legal benefits.  
+• Prepaid medicine. 
+• Life insurance and funeral assistance. 
+• Internet allowance. 
+• Home office stipend. 
+• 100% remote work environment and a strong work-life balance. 
+• Budget for training and professional growth. 
+• 5 Personal Time Off days per year. 
+• Sick Leave top-up to 100% of salary, paid by the employer from Day 3 to Day 90. 
