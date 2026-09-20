@@ -1,6 +1,8 @@
 package com.caseware.fanout;
 
 import java.time.Duration;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -11,8 +13,12 @@ import java.util.concurrent.locks.ReentrantLock;
  * would be answered by feeding it the whole queue as fast as it can refuse, spending each row's retry budget on a
  * condition that has nothing to do with that row and dead-lettering the publish.
  *
- * <p>Consecutive failures are counted. At {@code failuresBeforePause} the gate closes and reopens after
- * {@code pause}. The count survives reopening, so the next failure closes it again; a single success clears it.
+ * <p>Failures are counted per distinct engagement since the last success: an outage fails many engagements, a bad
+ * row fails only itself. Counting failures instead would let one corrupt file that fails every time it is loaded
+ * declare the downstream out, and a row the downstream never says anything bad about can never be dead-lettered,
+ * so it would be retried for ever. At {@code failuresBeforePause} distinct engagements the gate closes and reopens
+ * after {@code pause}. The set survives reopening, so the next new engagement to fail closes it again; a single
+ * success clears it.
  */
 final class DownstreamGate {
 
@@ -28,7 +34,7 @@ final class DownstreamGate {
     private final Events events;
     private final Lock lock = new ReentrantLock();
     private final Condition opened = lock.newCondition();
-    private int consecutiveFailures;
+    private final Set<EngagementId> failingSinceLastSuccess = new HashSet<>();
     private boolean closed;
 
     DownstreamGate(int failuresBeforePause, Duration pause, Timer timer, Events events) {
@@ -39,13 +45,13 @@ final class DownstreamGate {
     }
 
     /** Returns true when the downstream, not the row, is what failed: the caller must not charge the row for it. */
-    boolean recordFailure(Throwable cause) {
+    boolean recordFailure(EngagementId engagementId, Throwable cause) {
         boolean justClosed;
         boolean downstreamIsOut;
         lock.lock();
         try {
-            consecutiveFailures++;
-            downstreamIsOut = consecutiveFailures >= failuresBeforePause;
+            failingSinceLastSuccess.add(engagementId);
+            downstreamIsOut = failingSinceLastSuccess.size() >= failuresBeforePause;
             justClosed = downstreamIsOut && !closed;
             if (justClosed) closed = true;
         } finally {
@@ -65,7 +71,7 @@ final class DownstreamGate {
     void recordSuccess() {
         lock.lock();
         try {
-            consecutiveFailures = 0;
+            failingSinceLastSuccess.clear();
         } finally {
             lock.unlock();
         }

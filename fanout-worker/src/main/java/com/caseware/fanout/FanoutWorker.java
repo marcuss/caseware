@@ -26,11 +26,12 @@ import com.caseware.fanout.PublishHandle.Settlement;
  *
  * <p>Promises. The same publish submitted twice runs once, and two publishes over the same template load each
  * engagement once, because a row is claimed by engagement and not by publish. A load is never made for a row that
- * no longer needs it. A row is dead-lettered only for a failure that is about that row: a refusal, a timeout or a
- * downstream outage costs the row no attempt and stops dispatch instead. Every task settles on every path,
- * including one where the dead-letter queue, the store or a listener throws, and a publish that could not record
- * a row fails rather than completes, so the delivery is not acknowledged. Shutdown lets in-flight loads finish
- * and leaves queued work to the next delivery of the same publish.
+ * no longer needs it. A row is charged an attempt, and so can eventually be dead-lettered, only for a failure that
+ * is about that row: while the engagement system is out, or is refusing calls outright, nothing is charged to any
+ * row and dispatch stops instead. Every task settles on every path, including one where the dead-letter queue, the
+ * store or a listener throws, and a publish that could not record a row fails rather than completes, so the
+ * delivery is not acknowledged. Shutdown lets in-flight loads finish and fails the outcome of every publish that
+ * still owed work, so the next delivery re-derives it from the projection.
  */
 public final class FanoutWorker {
 
@@ -96,28 +97,26 @@ public final class FanoutWorker {
         PublishFeed feed = new PublishFeed(job.templateId(), handle, projection, policy.pageSize(),
                 task -> enqueue(handle, task), handle::fail);
         feeds.put(job.publishId(), feed);
-        handle.onCancel(feed::stop);
         safely(() -> listener.publishAccepted(job.publishId()));
         feed.readAhead();
         return handle;
-    }
-
-    /** Operator stop for one publish, by id, so a message on another delivery can stop it. */
-    public boolean cancel(PublishId publishId) {
-        PublishHandle handle = active.get(publishId);
-        if (handle == null) return false;
-        handle.cancel();
-        return true;
     }
 
     public void start() {
         dispatcher.start();
     }
 
-    /** Stops dispatching. Loads in flight finish and are recorded; queued work waits for the publish to be delivered again. */
+    /**
+     * Stops dispatching. Loads in flight finish and are recorded, and every publish that still owed work fails at
+     * once: queued work and work parked on the retry timer are both unrecorded, so the delivery must not be
+     * acknowledged and the next process re-derives what is left from the projection. Failing here rather than in
+     * {@link #awaitTermination} is what stops a retry the timer fires a moment later from settling the last task
+     * of a publish and completing it normally with rows still unverified.
+     */
     public void shutdown() {
         stopping = true;
         feeds.values().forEach(PublishFeed::stop);
+        failEveryActivePublish();
         boolean interrupted = false;
         dispatcher.interrupt();
         while (dispatcher.isAlive()) {
@@ -132,15 +131,21 @@ public final class FanoutWorker {
         if (interrupted) Thread.currentThread().interrupt();
     }
 
-    /** Waits for in-flight loads, then fails the outcome of every publish that still had work queued. */
+    /** Waits for the loads that were in flight at shutdown to finish and be recorded. */
     public boolean awaitTermination(Duration timeout) throws InterruptedException {
         boolean drained = loads.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS);
-        active.values().forEach(handle -> handle.abandon("worker shut down before publish " + handle.publishId() + " finished"));
+        // A submission that raced the shutdown flag could have landed after shutdown's sweep; this catches it.
+        failEveryActivePublish();
         return drained;
     }
 
     public int queued() {
         return queue.size();
+    }
+
+    private void failEveryActivePublish() {
+        active.values().forEach(handle -> handle.fail(new IllegalStateException(
+                "worker shut down before publish " + handle.publishId() + " finished")));
     }
 
     private void dispatch() {
@@ -162,10 +167,6 @@ public final class FanoutWorker {
     private void dispatchOne() throws InterruptedException {
         gate.awaitOpen();
         QueuedTask next = queue.take();
-        if (next.publish().isCancelled()) {
-            drop(next, "publish cancelled");
-            return;
-        }
         Slot slot = capacity.acquire();
         safely(() -> listener.taskDispatched(next.task(), next.attempt()));
         try {
@@ -176,19 +177,23 @@ public final class FanoutWorker {
         }
     }
 
+    /**
+     * One attempt. Whether the failure was the downstream's or this row's is decided once, here, and used by both
+     * the slot accounting and the settlement: they must not be allowed to answer it differently, or a row the cap
+     * is blamed for is a row nobody ever charges.
+     */
     private void runOne(QueuedTask queued, Slot slot) {
         EngagementVerifier.Result result = null;
+        boolean downstreamIsOut = false;
         try {
             try {
-                // A slot can be waited for over a minute, so the publish may have been cancelled since. The load
-                // is what is expensive, not the slot, and nothing has been spent yet.
-                result = queued.publish().isCancelled()
-                        ? new Dropped("publish cancelled")
-                        : verifier.verify(queued.task());
+                result = verifier.verify(queued.task());
+                downstreamIsOut = result instanceof Failed failed && failed.kind() != Kind.TERMINAL
+                        && gate.recordFailure(queued.task().engagementId(), failed.cause());
             } finally {
-                releaseSlot(slot, result);
+                releaseSlot(slot, result, downstreamIsOut);
             }
-            settle(queued, result);
+            settle(queued, result, downstreamIsOut);
         } catch (Throwable unexpected) {
             // Everything between the load and the settlement is a call into code this module does not own. If one
             // of them throws, the task still settles, or the publish would never complete and no redelivery could
@@ -199,17 +204,21 @@ public final class FanoutWorker {
     }
 
     /**
-     * Returns the slot. A refusal or a timeout is the engagement system saying the cap is too high, so it halves
-     * the cap once for the generation of dispatches this slot came from. A timeout also keeps the slot: the load
-     * we stopped waiting for is still running down there, and releasing the slot now would let the worker double
-     * its real concurrency against the team it is being polite to.
+     * Returns the slot. A refusal is the engagement system saying outright that the cap is too high, and a timeout
+     * says the same only when the downstream is out; one slow file while its neighbours load fine is not a cap
+     * that is too high, and halving the region's cap for it would leave the worker at one slot with nothing but an
+     * operator to raise it again. A timeout does keep its slot either way, for the rest of the load budget: the
+     * load we stopped waiting for is still running down there, and releasing the slot now would let the worker
+     * double its real concurrency against the team it is being polite to.
      */
-    private void releaseSlot(Slot slot, EngagementVerifier.Result result) {
-        if (!(result instanceof Failed failed) || !saysTheCapIsTooHigh(failed.kind())) {
+    private void releaseSlot(Slot slot, EngagementVerifier.Result result, boolean downstreamIsOut) {
+        if (!(result instanceof Failed failed)) {
             capacity.release();
             return;
         }
-        capacity.shrink(slot).ifPresent(to -> safely(() -> listener.capacityShrunk(slot.limit(), to)));
+        if (failed.kind() == Kind.OVER_CAPACITY || (failed.kind() == Kind.TIMED_OUT && downstreamIsOut)) {
+            capacity.shrink(slot).ifPresent(to -> safely(() -> listener.capacityShrunk(slot.limit(), to)));
+        }
         Duration stillRunningDownstream = failed.kind() == Kind.TIMED_OUT
                 ? policy.loadBudget().minus(failed.elapsed())
                 : Duration.ZERO;
@@ -217,11 +226,7 @@ public final class FanoutWorker {
         capacity.release();
     }
 
-    private static boolean saysTheCapIsTooHigh(DownstreamFailure.Kind kind) {
-        return kind == Kind.OVER_CAPACITY || kind == Kind.TIMED_OUT;
-    }
-
-    private void settle(QueuedTask queued, EngagementVerifier.Result result) {
+    private void settle(QueuedTask queued, EngagementVerifier.Result result, boolean downstreamIsOut) {
         switch (result) {
             case Verified verified -> {
                 gate.recordSuccess();
@@ -233,31 +238,28 @@ public final class FanoutWorker {
                 gate.recordSuccess();
                 loadAgain(queued, superseded.reason());
             }
-            case Failed failed -> afterFailure(queued, failed);
+            case Failed failed -> afterFailure(queued, failed, downstreamIsOut);
             case StoreFailed storeFailed -> afterStoreFailure(queued, storeFailed.cause());
         }
     }
 
-    private void afterFailure(QueuedTask queued, Failed failed) {
-        if (queued.publish().isCancelled()) {
-            drop(queued, "publish cancelled");
-            return;
-        }
+    private void afterFailure(QueuedTask queued, Failed failed, boolean downstreamIsOut) {
         if (failed.kind() == Kind.TERMINAL) {
-            deadLetter(queued, failed.cause());
+            deadLetter(queued, failed);
             return;
         }
-        boolean downstreamIsOut = gate.recordFailure(failed.cause());
-        if (downstreamIsOut || failed.kind() != Kind.TRANSIENT) {
+        if (downstreamIsOut || failed.kind() == Kind.OVER_CAPACITY) {
             waitForTheDownstream(queued, failed.cause());
             return;
         }
-        retryThisRow(queued, failed.cause());
+        // TRANSIENT or TIMED_OUT while the engagement system is otherwise healthy: the file is what is wrong, so
+        // the row is charged and reaches the dead-letter queue at the ceiling instead of being retried for ever.
+        retryThisRow(queued, failed);
     }
 
     /**
-     * A refusal, a timeout or an outage says nothing about this engagement, so it costs the row no attempt and can
-     * never dead-letter it. Dispatch is already stopped by the gate if the downstream is out; the row waits with
+     * A refusal or an outage says nothing about this engagement, so it costs the row no attempt and can never
+     * dead-letter it. Dispatch is already stopped by the gate if the downstream is out; the row waits with
      * everything else and is tried again when it comes back.
      */
     private void waitForTheDownstream(QueuedTask queued, Throwable cause) {
@@ -270,16 +272,16 @@ public final class FanoutWorker {
     }
 
     /** This row's own load failed while the downstream was otherwise healthy, so it is charged to the row. */
-    private void retryThisRow(QueuedTask queued, Throwable cause) {
+    private void retryThisRow(QueuedTask queued, Failed failed) {
         Optional<Duration> delay = policy.retries().delayBefore(queued.attempt() + 1);
         if (delay.isEmpty()) {
-            deadLetter(queued, cause);
+            deadLetter(queued, failed);
             return;
         }
         if (later(delay.get(), () -> requeue(queued.nextAttempt()))) {
-            safely(() -> listener.retryScheduled(queued.task(), queued.attempt() + 1, delay.get(), cause));
+            safely(() -> listener.retryScheduled(queued.task(), queued.attempt() + 1, delay.get(), failed.cause()));
         } else {
-            unsettled(queued, cause);
+            unsettled(queued, failed.cause());
         }
     }
 
@@ -319,8 +321,12 @@ public final class FanoutWorker {
     }
 
     private void requeue(QueuedTask retry) {
-        if (stopping || retry.publish().isCancelled()) {
-            drop(retry, stopping ? "worker stopping" : "publish cancelled");
+        if (stopping) {
+            // A retry the worker never got to run is work it owes and did not do, not work that was not needed.
+            // Settling it as dropped would let the publish complete normally and be acknowledged with the row
+            // still unverified and no delivery left to re-drive it.
+            unsettled(retry, new IllegalStateException(
+                    "worker stopped before " + retry.task().engagementId() + " was verified"));
             return;
         }
         queue.offer(retry);
@@ -333,26 +339,31 @@ public final class FanoutWorker {
 
     private void abandon(QueuedTask queued, String reason) {
         safely(() -> listener.taskAbandoned(queued.task(), reason));
-        finish(queued, Settlement.DROPPED);
+        finish(queued, Settlement.ABANDONED);
     }
 
-    private void deadLetter(QueuedTask queued, Throwable cause) {
+    /**
+     * Sends the dead letter first and marks the row second, so a crash between them duplicates a letter rather
+     * than losing one. The mark is guarded by the sequence this attempt read, the same guard the verification
+     * write would have used: a row that merely moved on while it waited its turn is still marked, and only a user
+     * acting during the load refuses it. That refusal leaves an operator holding a letter for a row the store does
+     * not call dead, which is a row still unverified and nobody's scheduled work, so it is reported abandoned.
+     */
+    private void deadLetter(QueuedTask queued, Failed failed) {
         VerifyTask task = queued.task();
         boolean marked;
         try {
-            deadLetters.send(new DeadLetter(task, queued.attempt(), cause));
-            marked = projection.recordDeadLettered(task.engagementId(), task.lastSeqAtEnqueue());
+            deadLetters.send(new DeadLetter(task, queued.attempt(), failed.seqAtLoad(), failed.cause()));
+            marked = projection.recordDeadLettered(task.engagementId(), failed.seqAtLoad());
         } catch (RuntimeException notRecorded) {
             unsettled(queued, notRecorded);
             return;
         }
         if (!marked) {
-            // The row moved on while we were failing: it is not dead, and the operator holding the dead letter
-            // needs to know that before replaying it.
-            drop(queued, "row moved on before the dead letter");
+            abandon(queued, "row moved on during the load; the dead letter was already sent");
             return;
         }
-        safely(() -> listener.taskDeadLettered(task, queued.attempt(), cause));
+        safely(() -> listener.taskDeadLettered(task, queued.attempt(), failed.cause()));
         finish(queued, Settlement.DEAD_LETTERED);
     }
 

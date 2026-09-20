@@ -33,15 +33,14 @@ final class PublishFeed {
         this.onFailure = onFailure;
     }
 
-    /** Reads pages until the publish has a page of work waiting, the rows run out, or the publish is cancelled. */
+    /** Reads pages until the publish has a page of work waiting or the rows run out. */
     void readAhead() {
         lock.lock();
         try {
             if (reading) return;
             reading = true;
             try {
-                while (!done && !handle.isCancelled() && handle.outstanding() < pageSize) readPage();
-                if (handle.isCancelled()) finish();
+                while (!done && handle.outstanding() < pageSize) readPage();
             } catch (RuntimeException storeFailed) {
                 // Not finish(): the publish is not complete, it is failing. Completing it here would tell the
                 // adapter to acknowledge a delivery whose rows were never read.
@@ -55,7 +54,7 @@ final class PublishFeed {
         }
     }
 
-    /** Stops reading: the publish is cancelled or the worker is stopping. What is queued still settles. */
+    /** Stops reading: the worker is stopping. What is already queued still settles. */
     void stop() {
         lock.lock();
         try {

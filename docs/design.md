@@ -80,7 +80,7 @@ Migration needs no window. Existing files are seeded as `UNKNOWN` rows from the 
 
 Backfill piggybacks on normal use, because every session end confirms a row for free. The verifier sweeps the rest, round-robin, and no firm may hold more than 5% of its region's slots while another firm there waits. The largest firm alone is 667 slot-hours, so the cap stops it starving the other 3,999, and it takes every idle slot once they finish. The brief does not say what spare capacity the engagement team has. I assume 50 concurrent loads, to be negotiated before any date is promised: 33 in `us-east-1`, 17 across the other two, so 11 days (§3, row 3). At 25 it is 22 days.
 
-A verifier result is not always safe to write, because the user may apply an update during the one-minute load. So the enqueue carries `lastSeqAtEnqueue` and a write whose `lastSeq` no longer matches is discarded. The verifier also re-reads the row before loading, to drop jobs that have moved on. Both guards belong to the Part 2 contract.
+A verifier result is not always safe to write, because the user may apply an update during the one-minute load. So the verifier re-reads the row before loading, to drop jobs that have moved on, and every write it then makes is conditional on the `seq` that read saw, so a write raced by a user event is discarded. A row that merely moved on while it queued still gets loaded and settled; only a move during the load throws the answer away. Both guards belong to the Part 2 contract.
 
 ## 3. Scale, cost and operational characteristics
 
