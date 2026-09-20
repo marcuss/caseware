@@ -16,12 +16,28 @@ final class RecordingListener implements WorkerListener {
 
     private final Lock lock = new ReentrantLock();
     private final Condition recorded = lock.newCondition();
+    private final List<PublishId> accepted = new ArrayList<>();
+    private final List<PublishId> finished = new ArrayList<>();
     private final List<VerifyTask> dispatched = new ArrayList<>();
     private final Map<EngagementId, String> droppedReasons = new LinkedHashMap<>();
+    private final Map<EngagementId, String> abandonedReasons = new LinkedHashMap<>();
     private final List<Duration> retryDelays = new ArrayList<>();
+    private final List<String> requeueReasons = new ArrayList<>();
     private final List<int[]> capacityChanges = new ArrayList<>();
+    private final List<Throwable> unsettled = new ArrayList<>();
+    private final List<Throwable> dispatcherFailures = new ArrayList<>();
     private int verified;
-    private int deadLettered;
+    private int pauses;
+
+    @Override
+    public void publishAccepted(PublishId publishId) {
+        record(() -> accepted.add(publishId));
+    }
+
+    @Override
+    public void publishFinished(PublishId publishId, PublishOutcome outcome) {
+        record(() -> finished.add(publishId));
+    }
 
     @Override
     public void taskDispatched(VerifyTask task, int attempt) {
@@ -39,18 +55,38 @@ final class RecordingListener implements WorkerListener {
     }
 
     @Override
+    public void taskAbandoned(VerifyTask task, String reason) {
+        record(() -> abandonedReasons.put(task.engagementId(), reason));
+    }
+
+    @Override
+    public void taskRequeued(VerifyTask task, Duration delay, String reason) {
+        record(() -> requeueReasons.add(reason));
+    }
+
+    @Override
     public void retryScheduled(VerifyTask task, int nextAttempt, Duration delay, Throwable cause) {
         record(() -> retryDelays.add(delay));
     }
 
     @Override
-    public void taskDeadLettered(VerifyTask task, int attempts, Throwable cause) {
-        record(() -> deadLettered++);
+    public void taskUnsettled(VerifyTask task, Throwable cause) {
+        record(() -> unsettled.add(cause));
     }
 
     @Override
     public void capacityShrunk(int from, int to) {
         record(() -> capacityChanges.add(new int[] {from, to}));
+    }
+
+    @Override
+    public void downstreamPaused(Duration pause, Throwable cause) {
+        record(() -> pauses++);
+    }
+
+    @Override
+    public void dispatcherFailed(Throwable cause) {
+        record(() -> dispatcherFailures.add(cause));
     }
 
     /** Waits until {@code condition} holds over the recorded hooks. The timeout is a failure, not a pause. */
@@ -70,6 +106,14 @@ final class RecordingListener implements WorkerListener {
         }
     }
 
+    List<PublishId> accepted() {
+        return read(() -> List.copyOf(accepted));
+    }
+
+    List<PublishId> finished() {
+        return read(() -> List.copyOf(finished));
+    }
+
     List<VerifyTask> dispatched() {
         return read(() -> List.copyOf(dispatched));
     }
@@ -78,20 +122,36 @@ final class RecordingListener implements WorkerListener {
         return read(() -> Map.copyOf(droppedReasons));
     }
 
+    Map<EngagementId, String> abandonedReasons() {
+        return read(() -> Map.copyOf(abandonedReasons));
+    }
+
     List<Duration> retryDelays() {
         return read(() -> List.copyOf(retryDelays));
+    }
+
+    List<String> requeueReasons() {
+        return read(() -> List.copyOf(requeueReasons));
     }
 
     List<int[]> capacityChanges() {
         return read(() -> List.copyOf(capacityChanges));
     }
 
+    List<Throwable> unsettled() {
+        return read(() -> List.copyOf(unsettled));
+    }
+
+    List<Throwable> dispatcherFailures() {
+        return read(() -> List.copyOf(dispatcherFailures));
+    }
+
     int verified() {
         return read(() -> verified);
     }
 
-    int deadLettered() {
-        return read(() -> deadLettered);
+    int pauses() {
+        return read(() -> pauses);
     }
 
     private void record(Runnable change) {

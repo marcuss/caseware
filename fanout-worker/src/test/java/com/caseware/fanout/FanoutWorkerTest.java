@@ -1,5 +1,6 @@
 package com.caseware.fanout;
 
+import static java.util.stream.Collectors.toMap;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -12,22 +13,28 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import com.caseware.fanout.DownstreamFailure.Kind;
 import com.caseware.fanout.ProjectionRow.Verification;
 
 /**
- * Each test proves one promise of the worker. Time never passes on its own: the downstream holds calls until the
- * test releases them, retries wait on a timer the test advances, and every wait is for a condition, not a duration.
+ * Each test proves one promise of the worker. Time never passes on its own: the downstream holds, refuses or fails
+ * calls exactly when the test says so, retries and backoff wait on a timer the test advances, and every wait is
+ * for a condition, not a duration.
  */
 class FanoutWorkerTest {
 
     private static final String TEMPLATE = "audit-2026";
+    private static final Duration BACKOFF = Duration.ofSeconds(10);
+    private static final Duration LOAD_BUDGET = Duration.ofMinutes(1);
 
     private final FakeEngagementSystem engagements = new FakeEngagementSystem();
     private final InMemoryProjectionStore projection = new InMemoryProjectionStore();
@@ -35,10 +42,12 @@ class FanoutWorkerTest {
     private final ManualTimer timer = new ManualTimer();
     private final RecordingListener listener = new RecordingListener();
     private final RetryPolicy threeAttempts = new RetryPolicy(3, Duration.ofSeconds(1), Duration.ofSeconds(4));
+    private final WorkerPolicy policy = new WorkerPolicy(threeAttempts, 5, BACKOFF, LOAD_BUDGET, 1_000);
     private final List<FanoutWorker> workers = new ArrayList<>();
 
     @AfterEach
     void stopWorkers() throws InterruptedException {
+        engagements.recover();
         engagements.releaseAll();
         for (FanoutWorker worker : workers) {
             worker.shutdown();
@@ -70,8 +79,8 @@ class FanoutWorkerTest {
     }
 
     @Test
-    void thePublishDeliveredTwice_runsOnceAndLoadsEachEngagementOnce() throws Exception {
-        projection.seed(TEMPLATE, firm("a"), 6);
+    void thePublishDeliveredTwice_runsOnceAndWritesEachEngagementsOwnVersion() throws Exception {
+        List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 6);
         engagements.holdCalls();
         FanoutWorker worker = startWorker(new DownstreamCapacity(2));
 
@@ -83,11 +92,51 @@ class FanoutWorkerTest {
         engagements.releaseAll();
         assertEquals(new PublishOutcome(6, 0, 0, false), outcomeOf(first));
         assertEquals(6, engagements.arrivals());
+        assertEquals(ids.stream().collect(toMap(id -> id, id -> "v-" + id)), projection.baseVersions(),
+                "every row holds the version loaded for that engagement, not another's");
 
         PublishHandle afterwards = worker.submit(publish("p1"));
         assertNotSame(first, afterwards);
         assertEquals(new PublishOutcome(0, 0, 0, false), outcomeOf(afterwards), "nothing is left for a late redelivery");
         assertEquals(6, engagements.arrivals());
+        assertEquals(listener.accepted(), listener.finished(), "no publish finishes that was never reported accepted");
+    }
+
+    @Test
+    void twoPublishesOverOneTemplate_shareOneLoadPerEngagement() throws Exception {
+        List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 6);
+        engagements.holdCalls();
+        FanoutWorker worker = startWorker(new DownstreamCapacity(12));
+
+        PublishHandle real = worker.submit(publish("p-v6"));
+        engagements.awaitArrivals(6);
+
+        PublishHandle nightly = worker.submit(new PublishJob(new PublishId("p-nightly"), TEMPLATE));
+        assertEquals(new PublishOutcome(0, 6, 0, false), outcomeOf(nightly),
+                "the nightly sweep finds every row claimed and settles without waiting for a load");
+        assertEquals(6, engagements.arrivals(), "a row already being loaded is not loaded a second time for another publish");
+
+        engagements.releaseAll();
+        assertEquals(new PublishOutcome(6, 0, 0, false), outcomeOf(real));
+        assertEquals(6, engagements.arrivals(), "the scarce thing is a load per engagement, not per publish");
+        assertEquals(ids.stream().collect(toMap(id -> id, id -> "v-" + id)), projection.baseVersions());
+    }
+
+    @Test
+    void aRowThatWasSettledWhileTheWorkerWasFailing_isNotReportedAsGivenUp() throws Exception {
+        List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 3);
+        EngagementId poison = ids.get(1);
+        engagements.poison(poison, Kind.TERMINAL);
+        engagements.duringEachLoad(id -> {
+            if (id.equals(poison)) projection.bumpSeq(id);
+        });
+        FanoutWorker worker = startWorker(new DownstreamCapacity(2));
+
+        assertEquals(new PublishOutcome(2, 1, 0, false), outcomeOf(worker.submit(publish("p1"))),
+                "a row that moved on is not counted as a row the worker gave up on");
+        assertEquals(Map.of(poison, "row moved on before the dead letter"), listener.droppedReasons());
+        assertEquals(Verification.UNVERIFIED, projection.read(poison).orElseThrow().verification(),
+                "the conditional mark was refused, so the row is not dead");
     }
 
     @Test
@@ -114,7 +163,7 @@ class FanoutWorkerTest {
 
     @Test
     void crashMidRun_repeatsOnlyTheLoadsThatWereInFlight_andRecordsEachRowOnce() throws Exception {
-        projection.seed(TEMPLATE, firm("a"), 6);
+        List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 6);
         engagements.holdCalls();
         FanoutWorker crashed = startWorker(new DownstreamCapacity(2));
         crashed.submit(publish("p1"));
@@ -129,31 +178,65 @@ class FanoutWorkerTest {
         assertEquals(2, projection.count(Verification.VERIFIED), "the crashed process's late results still land");
 
         engagements.releaseAll();
-        assertEquals(new PublishOutcome(4, 2, 0, false), outcomeOf(handle), "the replacement's repeats are discarded, not double-written");
+        assertEquals(new PublishOutcome(4, 2, 0, false), outcomeAfterBackoff(handle),
+                "the replacement's repeats are discarded, not double-written");
         assertEquals(6, projection.count(Verification.VERIFIED));
         assertEquals(8, engagements.arrivals(), "only the two loads in flight at the crash were repeated");
+        assertEquals(ids.stream().collect(toMap(id -> id, id -> "v-" + id)), projection.baseVersions(),
+                "each row holds its own engagement's version, whichever process wrote it");
     }
 
     @Test
-    void aDownstreamRefusingLoadsOverItsCap_shrinksTheCapOnce_andEveryEngagementIsStillVerified() throws Exception {
+    void aRefusedLoad_shrinksTheCap_andTheRowIsTriedAgainWithoutBeingChargedForIt() throws Exception {
         projection.seed(TEMPLATE, firm("a"), 6);
-        engagements.ownLimit(2);
-        engagements.holdCalls();
+        engagements.refuseNext(2);
         DownstreamCapacity capacity = new DownstreamCapacity(4);
         FanoutWorker worker = startWorker(capacity);
 
         PublishHandle handle = worker.submit(publish("p1"));
-        engagements.awaitArrivals(4);
-        listener.awaitUntil(() -> listener.retryDelays().size() >= 2, "the two refused loads to be scheduled for retry");
-        assertEquals(2, engagements.rejections());
-        assertEquals(2, capacity.limit(), "two rejections from one window halve the cap once");
-        assertEquals(1, listener.capacityChanges().size());
+        listener.awaitUntil(() -> listener.requeueReasons().size() == 2, "both refused loads to be put back");
+        assertTrue(capacity.limit() < 4, "a refusal shrinks the cap");
+        assertFalse(listener.capacityChanges().isEmpty(), "and the operator is told the cap moved");
+        assertTrue(listener.retryDelays().isEmpty(), "a refusal is the downstream's condition, not the row's");
 
-        engagements.releaseAll();
-        timer.advance(Duration.ofSeconds(1));
-        assertEquals(new PublishOutcome(6, 0, 0, false), outcomeOf(handle));
-        assertEquals(2, engagements.rejections(), "no further rejections once the cap fits");
-        assertEquals(8, engagements.arrivals());
+        assertEquals(new PublishOutcome(6, 0, 0, false), outcomeAfterBackoff(handle));
+        assertEquals(2, engagements.refusals(), "no further refusals once the cap fits");
+        assertEquals(8, engagements.arrivals(), "the two refused loads were tried again, nothing else");
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"OVER_CAPACITY", "TRANSIENT"})
+    void aDownstreamOutage_stopsDispatchAndDeadLettersNothing(Kind kind) throws Exception {
+        projection.seed(TEMPLATE, firm("a"), 8);
+        engagements.failEveryCall(kind);
+        FanoutWorker worker = startWorker(new DownstreamCapacity(4));
+
+        PublishHandle handle = worker.submit(publish("p1"));
+        listener.awaitUntil(() -> listener.pauses() == 1, "dispatch to stop while the engagement system is out");
+        engagements.recover();
+
+        assertEquals(new PublishOutcome(8, 0, 0, false), outcomeAfterBackoff(handle),
+                "an outage costs no row its retry budget, so every row is still verified");
+        assertEquals(0, deadLetters.count(), "nothing an operator has to replay");
+        assertEquals(0, projection.count(Verification.DEAD_LETTERED));
+        assertEquals(8, projection.count(Verification.VERIFIED));
+    }
+
+    @Test
+    void aTimedOutLoad_keepsItsSlotUntilThatLoadsBudgetHasRunOut() throws Exception {
+        projection.seed(TEMPLATE, firm("a"), 4);
+        engagements.failEveryCall(Kind.TIMED_OUT);
+        DownstreamCapacity capacity = new DownstreamCapacity(4);
+        FanoutWorker worker = startWorker(capacity);
+
+        PublishHandle handle = worker.submit(publish("p1"));
+        listener.awaitUntil(() -> listener.requeueReasons().size() >= 1, "the timed-out row to be put back");
+        assertTrue(capacity.limit() < 4, "a timeout says the cap is too high, just as a refusal does");
+        assertTrue(capacity.inFlight() >= 1, "the engagement system is still running the load we stopped waiting for");
+
+        engagements.recover();
+        assertEquals(new PublishOutcome(4, 0, 0, false), outcomeAfterBackoff(handle));
+        assertEquals(0, deadLetters.count());
     }
 
     @Test
@@ -176,7 +259,7 @@ class FanoutWorkerTest {
     }
 
     @Test
-    void aTransientFailure_retriesWithBackoff_thenDeadLettersAtTheCeiling_withoutStallingThePublish() throws Exception {
+    void aTransientFailureOnOneRow_retriesWithBackoff_thenDeadLettersAtTheCeiling_withoutStallingThePublish() throws Exception {
         List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 5);
         EngagementId poison = ids.get(0);
         engagements.poison(poison, Kind.TRANSIENT);
@@ -200,7 +283,105 @@ class FanoutWorkerTest {
     }
 
     @Test
-    void aRowThatMovedOn_isLeftAlone_whetherBeforeOrDuringTheLoad() throws Exception {
+    void aProjectionStoreThatThrows_isRetried_andNeverBlamedOnTheEngagement() throws Exception {
+        projection.seed(TEMPLATE, firm("a"), 3);
+        projection.failReads(2);
+        FanoutWorker worker = startWorker(new DownstreamCapacity(2));
+
+        assertEquals(new PublishOutcome(3, 0, 0, false), outcomeAfterBackoff(worker.submit(publish("p1"))));
+        assertEquals(3, engagements.arrivals(), "a store failure spends none of the other team's capacity");
+        assertEquals(0, deadLetters.count(), "our own store is never the engagement's fault");
+        assertEquals(0, projection.count(Verification.DEAD_LETTERED));
+    }
+
+    @Test
+    void aProjectionStoreThatStaysDown_leavesTheRowsUnverified_andFailsThePublish() throws Exception {
+        projection.seed(TEMPLATE, firm("a"), 3);
+        projection.failReads(100);
+        FanoutWorker worker = startWorker(new DownstreamCapacity(2));
+
+        ExecutionException failed = assertThrows(ExecutionException.class,
+                () -> settled(worker.submit(publish("p1"))).get(10, TimeUnit.SECONDS));
+        assertInstanceOf(IllegalStateException.class, failed.getCause(), "the delivery must not be acknowledged");
+        assertEquals(3, projection.count(Verification.UNVERIFIED), "the next delivery picks the rows up");
+        assertEquals(0, deadLetters.count());
+        assertEquals(3, listener.unsettled().size());
+    }
+
+    @Test
+    void aProjectionScanThatThrows_failsThePublish_andTheNextDeliveryRunsIt() throws Exception {
+        projection.seed(TEMPLATE, firm("a"), 3);
+        projection.failScans(1);
+        FanoutWorker worker = startWorker(new DownstreamCapacity(2));
+
+        ExecutionException failed = assertThrows(ExecutionException.class, () -> outcomeOf(worker.submit(publish("p1"))));
+        assertInstanceOf(IllegalStateException.class, failed.getCause(), "a publish whose rows we could not read is not acknowledged");
+        assertEquals(0, engagements.arrivals());
+
+        assertEquals(new PublishOutcome(3, 0, 0, false), outcomeOf(worker.submit(publish("p1"))),
+                "the redelivery reads the rows and runs the publish");
+    }
+
+    @Test
+    void aTimerThatRefusesToSchedule_failsThePublishRatherThanLosingTheRow() throws Exception {
+        List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 2);
+        engagements.poison(ids.get(0), Kind.TRANSIENT);
+        timer.refuseEverything();
+        FanoutWorker worker = startWorker(new DownstreamCapacity(2));
+
+        ExecutionException failed = assertThrows(ExecutionException.class, () -> outcomeOf(worker.submit(publish("p1"))));
+        assertInstanceOf(IllegalStateException.class, failed.getCause());
+        assertEquals(1, listener.unsettled().size(), "a retry that cannot be scheduled settles the task, it does not lose it");
+        assertEquals(Verification.UNVERIFIED, projection.read(ids.get(0)).orElseThrow().verification());
+        assertEquals(0, deadLetters.count());
+    }
+
+    @Test
+    void aDeadLetterQueueThatThrows_failsThePublishInsteadOfHangingIt() throws Exception {
+        List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 3);
+        EngagementId poison = ids.get(1);
+        engagements.poison(poison, Kind.TERMINAL);
+        deadLetters.failEverySend(new IllegalStateException("dead-letter queue unavailable"));
+        FanoutWorker worker = startWorker(new DownstreamCapacity(2));
+
+        PublishHandle handle = worker.submit(publish("p1"));
+        ExecutionException failed = assertThrows(ExecutionException.class, () -> outcomeOf(handle));
+        assertInstanceOf(IllegalStateException.class, failed.getCause());
+        assertEquals(1, listener.unsettled().size(), "the task settled even though the queue threw");
+        assertEquals(Verification.UNVERIFIED, projection.read(poison).orElseThrow().verification(),
+                "a row we could not record is left for the next delivery, not marked dead");
+        assertEquals(2, projection.count(Verification.VERIFIED), "the healthy rows still finished");
+
+        PublishHandle redelivered = worker.submit(publish("p1"));
+        assertNotSame(handle, redelivered, "the publish is not wedged in the worker; a redelivery re-drives it");
+        assertThrows(ExecutionException.class, () -> outcomeOf(redelivered));
+    }
+
+    @Test
+    void aListenerThatThrows_cannotStopThePublishFromFinishing() throws Exception {
+        projection.seed(TEMPLATE, firm("a"), 4);
+        WorkerListener breaks = new WorkerListener() {
+            @Override
+            public void taskDispatched(VerifyTask task, int attempt) {
+                listener.taskDispatched(task, attempt);
+                throw new IllegalStateException("metrics sink is down");
+            }
+
+            @Override
+            public void taskVerified(VerifyTask task, Duration loadTime) {
+                listener.taskVerified(task, loadTime);
+                throw new IllegalStateException("metrics sink is down");
+            }
+        };
+        FanoutWorker worker = startWorker(new DownstreamCapacity(2), policy, breaks);
+
+        assertEquals(new PublishOutcome(4, 0, 0, false), outcomeOf(worker.submit(publish("p1"))));
+        assertEquals(4, projection.count(Verification.VERIFIED));
+        assertTrue(listener.dispatcherFailures().isEmpty(), "observability failures never reach the dispatch loop");
+    }
+
+    @Test
+    void aRowThatMovesOn_isStillVerified_whetherItMovedBeforeOrDuringTheLoad() throws Exception {
         List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 3);
         engagements.holdCalls();
         FanoutWorker worker = newWorker(new DownstreamCapacity(1));
@@ -209,17 +390,50 @@ class FanoutWorkerTest {
         projection.bumpSeq(ids.get(0));
         projection.archive(ids.get(2));
         worker.start();
+
         engagements.awaitArrivals(1);
+        engagements.release(1);
+        listener.awaitUntil(() -> listener.verified() == 1, "the row that moved on while it waited to be loaded anyway");
+
+        engagements.awaitArrivals(2);
         projection.bumpSeq(ids.get(1));
         engagements.releaseAll();
 
-        assertEquals(new PublishOutcome(0, 3, 0, false), outcomeOf(handle));
-        assertEquals(1, engagements.arrivals(), "only the row that still needed a load was loaded");
-        assertEquals(0, projection.count(Verification.VERIFIED), "a stale result never overwrites a newer fact");
-        assertEquals(Map.of(ids.get(0), "row moved on before the load",
-                            ids.get(1), "row moved on during the load",
-                            ids.get(2), "engagement archived"),
-                listener.droppedReasons());
+        assertEquals(new PublishOutcome(2, 1, 0, false), outcomeAfterBackoff(handle));
+        assertEquals(3, engagements.arrivals(), "the row that moved on during the load was loaded again, not abandoned");
+        assertEquals(Map.of(ids.get(2), "engagement archived"), listener.droppedReasons());
+        assertEquals(Map.of(ids.get(0), "v-" + ids.get(0), ids.get(1), "v-" + ids.get(1)), projection.baseVersions());
+    }
+
+    @Test
+    void aRowThatKeepsMovingUnderEveryLoad_isReportedAbandoned_notDeadLettered() throws Exception {
+        List<EngagementId> ids = projection.seed(TEMPLATE, firm("a"), 1);
+        EngagementId busy = ids.get(0);
+        engagements.duringEachLoad(projection::bumpSeq);
+        FanoutWorker worker = startWorker(new DownstreamCapacity(1));
+
+        assertEquals(new PublishOutcome(0, 1, 0, false), outcomeAfterBackoff(worker.submit(publish("p1"))));
+        assertEquals(3, engagements.loadsOf(busy), "the row is loaded again rather than left to the next publish");
+        assertEquals(0, deadLetters.count(), "a user editing their file is nothing for an operator to replay");
+        assertEquals(Map.of(busy, "row moved on during the load"), listener.abandonedReasons(),
+                "an abandoned row is counted apart from work that was never needed");
+        assertTrue(listener.droppedReasons().isEmpty());
+    }
+
+    @Test
+    void rowsAreReadAPageAtATime_soAPublishIsNotHeldInMemoryAllAtOnce() throws Exception {
+        projection.seed(TEMPLATE, firm("a"), 10);
+        engagements.holdCalls();
+        WorkerPolicy twoRowsPerPage = new WorkerPolicy(threeAttempts, 5, BACKOFF, LOAD_BUDGET, 2);
+        FanoutWorker worker = startWorker(new DownstreamCapacity(1), twoRowsPerPage, listener);
+
+        PublishHandle handle = worker.submit(publish("p1"));
+        engagements.awaitArrivals(1);
+        assertTrue(worker.queued() <= 3, "the worker holds about a page, not the whole publish; it held " + worker.queued());
+
+        engagements.releaseAll();
+        assertEquals(new PublishOutcome(10, 0, 0, false), outcomeOf(handle), "every page is still read and verified");
+        assertEquals(10, engagements.arrivals());
     }
 
     @Test
@@ -248,23 +462,29 @@ class FanoutWorkerTest {
         PublishHandle handle = worker.submit(publish("p1"));
         engagements.awaitArrivals(2);
 
-        handle.cancel();
+        assertTrue(worker.cancel(new PublishId("p1")), "a withdrawal arrives as its own message, without the handle");
         engagements.releaseAll();
 
         assertEquals(new PublishOutcome(2, 8, 0, true), outcomeOf(handle));
         assertEquals(2, engagements.arrivals(), "no load starts after the cancel");
         assertEquals(2, projection.count(Verification.VERIFIED), "the minute already spent is not thrown away");
         assertEquals(0, worker.queued());
+        assertFalse(worker.cancel(new PublishId("p1")), "a publish that has finished cannot be cancelled");
     }
 
     private FanoutWorker startWorker(DownstreamCapacity capacity) {
-        FanoutWorker worker = newWorker(capacity);
+        return startWorker(capacity, policy, listener);
+    }
+
+    private FanoutWorker startWorker(DownstreamCapacity capacity, WorkerPolicy policy, WorkerListener listener) {
+        FanoutWorker worker = new FanoutWorker(projection, engagements, deadLetters, capacity, policy, timer, listener);
+        workers.add(worker);
         worker.start();
         return worker;
     }
 
     private FanoutWorker newWorker(DownstreamCapacity capacity) {
-        FanoutWorker worker = new FanoutWorker(projection, engagements, deadLetters, capacity, threeAttempts, timer, listener);
+        FanoutWorker worker = new FanoutWorker(projection, engagements, deadLetters, capacity, policy, timer, listener);
         workers.add(worker);
         return worker;
     }
@@ -277,11 +497,29 @@ class FanoutWorkerTest {
         return new FirmId(name);
     }
 
-    private static PublishOutcome outcomeOf(PublishHandle handle) throws Exception {
+    private PublishOutcome outcomeOf(PublishHandle handle) throws Exception {
         return outcomeOf(handle, Duration.ofSeconds(10));
     }
 
     private static PublishOutcome outcomeOf(PublishHandle handle, Duration timeout) throws Exception {
         return handle.outcome().toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    private PublishOutcome outcomeAfterBackoff(PublishHandle handle) throws Exception {
+        return settled(handle).get(10, TimeUnit.SECONDS);
+    }
+
+    /** Moves the clock on whenever the worker has parked work on it, until the publish is done. */
+    private CompletableFuture<PublishOutcome> settled(PublishHandle handle) {
+        CompletableFuture<PublishOutcome> outcome = handle.outcome().toCompletableFuture();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        while (!outcome.isDone()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the publish never finished; the timer holds " + timer.pending() + " actions");
+            }
+            if (timer.pending() > 0) timer.advance(BACKOFF);
+            else Thread.onSpinWait();
+        }
+        return outcome;
     }
 }

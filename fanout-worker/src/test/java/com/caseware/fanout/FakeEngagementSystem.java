@@ -7,24 +7,29 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import com.caseware.fanout.DownstreamFailure.Kind;
+
 /**
- * A downstream the test controls: it can hold every call until released, refuse calls over its own limit, and fail
- * chosen engagements. Counters are exact, so a test asserts on what happened rather than on timing.
+ * A downstream the test controls: it can hold every call until released, refuse a stated number of calls, fail
+ * everything until it is told to recover, and fail chosen engagements. Every failure is asked for by the test, so
+ * no assertion rests on which thread won a race.
  */
 final class FakeEngagementSystem implements EngagementSystem {
 
     private final Lock lock = new ReentrantLock();
     private final Condition changed = lock.newCondition();
-    private final Map<EngagementId, DownstreamFailure.Kind> poisoned = new HashMap<>();
+    private final Map<EngagementId, Kind> poisoned = new HashMap<>();
     private final Map<EngagementId, Integer> loadsPerEngagement = new HashMap<>();
-    private int ownLimit = Integer.MAX_VALUE;
+    private java.util.function.Consumer<EngagementId> duringLoad;
+    private Kind failEveryCall;
+    private int refusalsLeft;
     private boolean holding;
     private int nextTicket;
     private int releasedUpTo;
     private int arrivals;
     private int inFlight;
     private int maxInFlight;
-    private int rejections;
+    private int refusals;
 
     @Override
     public String loadEffectiveVersion(EngagementId engagementId) throws DownstreamFailure {
@@ -32,10 +37,15 @@ final class FakeEngagementSystem implements EngagementSystem {
         try {
             arrivals++;
             loadsPerEngagement.merge(engagementId, 1, Integer::sum);
-            if (inFlight >= ownLimit) {
-                rejections++;
-                changed.signalAll();
-                throw new DownstreamFailure(DownstreamFailure.Kind.OVER_CAPACITY, "engagement system at its limit");
+            changed.signalAll();
+            if (refusalsLeft > 0) {
+                refusalsLeft--;
+                refusals++;
+                throw new DownstreamFailure(Kind.OVER_CAPACITY, "engagement system at its limit");
+            }
+            if (failEveryCall != null) {
+                refusals++;
+                throw new DownstreamFailure(failEveryCall, "engagement system is " + failEveryCall);
             }
             inFlight++;
             maxInFlight = Math.max(maxInFlight, inFlight);
@@ -43,8 +53,9 @@ final class FakeEngagementSystem implements EngagementSystem {
             changed.signalAll();
             while (holding && ticket >= releasedUpTo) changed.awaitUninterruptibly();
             inFlight--;
+            if (duringLoad != null) duringLoad.accept(engagementId);
             changed.signalAll();
-            DownstreamFailure.Kind poison = poisoned.get(engagementId);
+            Kind poison = poisoned.get(engagementId);
             if (poison != null) throw new DownstreamFailure(poison, "poisoned " + engagementId);
             return "v-" + engagementId;
         } finally {
@@ -52,11 +63,29 @@ final class FakeEngagementSystem implements EngagementSystem {
         }
     }
 
-    void ownLimit(int limit) {
-        run(() -> ownLimit = limit);
+    /** Runs inside every load, which is how a test makes something happen while the engagement is being read. */
+    void duringEachLoad(java.util.function.Consumer<EngagementId> action) {
+        run(() -> duringLoad = action);
     }
 
-    void poison(EngagementId engagementId, DownstreamFailure.Kind kind) {
+    /** The next {@code n} calls are refused outright, whoever makes them. */
+    void refuseNext(int n) {
+        run(() -> refusalsLeft = n);
+    }
+
+    /** Every call fails this way until {@link #recover}. */
+    void failEveryCall(Kind kind) {
+        run(() -> failEveryCall = kind);
+    }
+
+    void recover() {
+        run(() -> {
+            failEveryCall = null;
+            refusalsLeft = 0;
+        });
+    }
+
+    void poison(EngagementId engagementId, Kind kind) {
         run(() -> poisoned.put(engagementId, kind));
     }
 
@@ -79,12 +108,16 @@ final class FakeEngagementSystem implements EngagementSystem {
 
     /** Waits until at least {@code n} calls have arrived, accepted or refused. The timeout is a failure, not a pause. */
     void awaitArrivals(int n) {
+        awaitUntil(() -> arrivals >= n, "at least " + n + " arrivals");
+    }
+
+    void awaitUntil(java.util.function.BooleanSupplier condition, String what) {
         lock.lock();
         try {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-            while (arrivals < n) {
+            while (!condition.getAsBoolean()) {
                 long left = deadline - System.nanoTime();
-                if (left <= 0) throw new AssertionError("expected " + n + " arrivals, saw " + arrivals);
+                if (left <= 0) throw new AssertionError("timed out waiting for " + what + "; arrivals=" + arrivals);
                 changed.awaitNanos(left);
             }
         } catch (InterruptedException e) {
@@ -106,8 +139,8 @@ final class FakeEngagementSystem implements EngagementSystem {
         return read(() -> maxInFlight);
     }
 
-    int rejections() {
-        return read(() -> rejections);
+    int refusals() {
+        return read(() -> refusals);
     }
 
     int loadsOf(EngagementId engagementId) {
