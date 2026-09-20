@@ -11,22 +11,30 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class DownstreamCapacity {
 
+    /**
+     * A held slot, tagged with the generation of dispatches it belongs to. A generation ends the moment the limit
+     * changes, which is what lets {@link #shrink} halve once for a whole burst of refusals: the first refusal ends
+     * the generation, and every other slot from it is then stale.
+     */
+    public record Slot(int limit, long generation) {}
+
     private final Lock lock = new ReentrantLock();
     private final Condition slotFreed = lock.newCondition();
     private int limit;
     private int inFlight;
+    private long generation;
 
     public DownstreamCapacity(int limit) {
         this.limit = requireAtLeastOne(limit);
     }
 
-    /** Blocks until a slot is free. Returns the limit in force at that moment, so a refusal can be attributed to it. */
-    public int acquire() throws InterruptedException {
+    /** Blocks until a slot is free. The slot carries the limit and generation it was taken in. */
+    public Slot acquire() throws InterruptedException {
         lock.lockInterruptibly();
         try {
             while (inFlight >= limit) slotFreed.await();
             inFlight++;
-            return limit;
+            return new Slot(limit, generation);
         } finally {
             lock.unlock();
         }
@@ -43,18 +51,21 @@ public final class DownstreamCapacity {
     }
 
     /**
-     * Returns a slot whose load the engagement system refused, halving the limit first if it is still
-     * {@code observedLimit}. The two happen together so the freed slot cannot be refilled at the limit that was just
-     * refused, and a burst of refusals from one window shrinks the limit once. Returns the new limit when this call
-     * changed it. The cap never grows on its own: that is the operator's decision, through {@link #setLimit}.
+     * Halves the limit because the engagement system refused or timed out the load this slot was taken for, and
+     * starts a new generation. A slot from an older generation changes nothing, so one busy window costs one
+     * halving, and an operator's {@link #setLimit} is never re-halved by a straggler. Returns the new limit when
+     * this call changed it. The cap never grows on its own: that is the operator's decision.
+     *
+     * <p>The slot is not released here. The caller decides when the downstream is actually free of the load, which
+     * for a timeout is not yet.
      */
-    public OptionalInt releaseRefused(int observedLimit) {
+    public OptionalInt shrink(Slot slot) {
         lock.lock();
         try {
-            inFlight--;
-            slotFreed.signal();
-            if (limit != observedLimit || limit == 1) return OptionalInt.empty();
+            if (slot.generation() != generation || limit == 1) return OptionalInt.empty();
             limit = Math.max(1, limit / 2);
+            generation++;
+            slotFreed.signalAll();
             return OptionalInt.of(limit);
         } finally {
             lock.unlock();
@@ -70,6 +81,7 @@ public final class DownstreamCapacity {
         lock.lock();
         try {
             limit = newLimit;
+            generation++;
             slotFreed.signalAll();
         } finally {
             lock.unlock();

@@ -11,14 +11,19 @@ final class ManualTimer implements Timer {
     private record Scheduled(Duration due, long order, Runnable action) {}
 
     private final List<Scheduled> pending = new ArrayList<>();
-    private final List<Duration> delays = new ArrayList<>();
     private Duration now = Duration.ZERO;
     private long counter;
+    private boolean refusing;
 
     @Override
     public synchronized void after(Duration delay, Runnable action) {
+        if (refusing) throw new IllegalStateException("timer is shut down");
         pending.add(new Scheduled(now.plus(delay), counter++, action));
-        delays.add(delay);
+    }
+
+    /** From now on scheduling throws, the way a shut-down ScheduledExecutorService does. */
+    synchronized void refuseEverything() {
+        refusing = true;
     }
 
     void advance(Duration by) {
@@ -32,11 +37,6 @@ final class ManualTimer implements Timer {
             pending.removeAll(due);
         }
         due.forEach(s -> s.action().run());
-    }
-
-    /** Every delay scheduled so far, in order. */
-    synchronized List<Duration> delays() {
-        return List.copyOf(delays);
     }
 
     synchronized int pending() {

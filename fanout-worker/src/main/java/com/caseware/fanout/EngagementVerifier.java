@@ -5,17 +5,28 @@ import java.util.Optional;
 
 /**
  * One attempt at one task: re-read the row, load the engagement only if the row still needs it, and write the
- * answer back under the sequence guard. Never throws; every way an attempt can end is a {@link Result}.
+ * answer back under the sequence guard. Never throws; every way an attempt can end is a {@link Result}, and the
+ * cases are separated by who failed, because the worker owes the engagement system and its own store different
+ * treatment.
  */
 final class EngagementVerifier {
 
-    sealed interface Result permits Verified, Dropped, Failed {}
+    sealed interface Result permits Verified, Dropped, Superseded, Failed, StoreFailed {}
 
+    /** The base version was loaded and written back. */
     record Verified(Duration loadTime) implements Result {}
 
+    /** The work is no longer needed: the engagement is archived, or someone else settled the row. */
     record Dropped(String reason) implements Result {}
 
-    record Failed(DownstreamFailure.Kind kind, Throwable cause) implements Result {}
+    /** The row still needs verifying, but a user event landed during the load, so this answer is out of date. */
+    record Superseded(String reason) implements Result {}
+
+    /** The engagement system failed, classified by what that says about trying again. */
+    record Failed(DownstreamFailure.Kind kind, Duration elapsed, Throwable cause) implements Result {}
+
+    /** The worker's own projection store failed. Never the engagement's fault, so never the engagement's penalty. */
+    record StoreFailed(Throwable cause) implements Result {}
 
     private final ProjectionStore projection;
     private final EngagementSystem engagements;
@@ -26,28 +37,45 @@ final class EngagementVerifier {
     }
 
     Result verify(VerifyTask task) {
+        Optional<ProjectionRow> row;
         try {
-            return attempt(task);
-        } catch (DownstreamFailure failure) {
-            return new Failed(failure.kind(), failure);
-        } catch (RuntimeException unexpected) {
-            return new Failed(DownstreamFailure.Kind.TERMINAL, unexpected);
+            row = projection.read(task.engagementId());
+        } catch (RuntimeException storeFailed) {
+            return new StoreFailed(storeFailed);
         }
-    }
-
-    private Result attempt(VerifyTask task) throws DownstreamFailure {
-        Optional<ProjectionRow> row = projection.read(task.engagementId());
         if (row.isEmpty()) return new Dropped("engagement archived");
         if (row.get().verification() != ProjectionRow.Verification.UNVERIFIED) {
             return new Dropped("row already " + row.get().verification());
         }
-        if (row.get().seq() != task.lastSeqAtEnqueue()) return new Dropped("row moved on before the load");
+        // The seq this read saw, not the one at enqueue: a row that moved on while it waited its turn still needs
+        // the load, and the write below is guarded by the same fresh seq, so a user who acts during the load
+        // still wins.
+        long expectedSeq = row.get().seq();
 
         long started = System.nanoTime();
-        String version = engagements.loadEffectiveVersion(task.engagementId());
-        Duration loadTime = Duration.ofNanos(System.nanoTime() - started);
+        String version;
+        try {
+            version = engagements.loadEffectiveVersion(task.engagementId());
+        } catch (DownstreamFailure failure) {
+            return new Failed(failure.kind(), since(started), failure);
+        } catch (RuntimeException unclassified) {
+            // The adapter broke its contract by not classifying this. Treat it as retryable: the alternative is to
+            // dead-letter a healthy engagement over a bug on our side of the call.
+            return new Failed(DownstreamFailure.Kind.TRANSIENT, since(started),
+                    new DownstreamFailure(DownstreamFailure.Kind.TRANSIENT, "unclassified failure from the engagement system", unclassified));
+        }
+        Duration loadTime = since(started);
 
-        boolean landed = projection.recordVerified(task.engagementId(), version, task.lastSeqAtEnqueue());
-        return landed ? new Verified(loadTime) : new Dropped("row moved on during the load");
+        boolean landed;
+        try {
+            landed = projection.recordVerified(task.engagementId(), version, expectedSeq);
+        } catch (RuntimeException storeFailed) {
+            return new StoreFailed(storeFailed);
+        }
+        return landed ? new Verified(loadTime) : new Superseded("row moved on during the load");
+    }
+
+    private static Duration since(long startedNanos) {
+        return Duration.ofNanos(System.nanoTime() - startedNanos);
     }
 }

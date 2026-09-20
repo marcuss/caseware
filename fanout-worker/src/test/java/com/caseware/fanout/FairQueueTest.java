@@ -10,7 +10,7 @@ import org.junit.jupiter.api.Test;
 class FairQueueTest {
 
     private final FairQueue queue = new FairQueue();
-    private final PublishHandle publish = new PublishHandle(new PublishId("p"), 100, (handle, outcome) -> {});
+    private final PublishHandle publish = new PublishHandle(new PublishId("p"), (handle, outcome) -> {});
 
     @Test
     void firmsTakeTurnsWhateverTheirBacklog() throws InterruptedException {
@@ -39,7 +39,7 @@ class FairQueueTest {
     private void offer(String firm, int count) {
         for (int i = 0; i < count; i++) {
             VerifyTask task = new VerifyTask(new PublishId("p"), new FirmId(firm), new EngagementId(firm + "-" + i), 1);
-            queue.offer(new QueuedTask(publish, task, 1));
+            queue.offer(QueuedTask.first(publish, task));
         }
     }
 

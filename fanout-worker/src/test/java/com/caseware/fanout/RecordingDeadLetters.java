@@ -6,14 +6,21 @@ import java.util.List;
 final class RecordingDeadLetters implements DeadLetterQueue {
 
     private final List<DeadLetter> entries = new ArrayList<>();
+    private RuntimeException failure;
+
+    /** From now on every send throws, the way an SQS call with expired credentials does. */
+    synchronized void failEverySend(RuntimeException failure) {
+        this.failure = failure;
+    }
 
     @Override
     public synchronized void send(DeadLetter deadLetter) {
+        if (failure != null) throw failure;
         entries.add(deadLetter);
     }
 
-    synchronized List<DeadLetter> entries() {
-        return List.copyOf(entries);
+    synchronized int count() {
+        return entries.size();
     }
 
     synchronized DeadLetter only() {
