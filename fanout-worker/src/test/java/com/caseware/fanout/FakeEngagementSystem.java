@@ -78,10 +78,12 @@ final class FakeEngagementSystem implements EngagementSystem {
         run(() -> failEveryCall = kind);
     }
 
+    /** The engagement system is healthy again: no outage, no refusals left, and no engagement still failing. */
     void recover() {
         run(() -> {
             failEveryCall = null;
             refusalsLeft = 0;
+            poisoned.clear();
         });
     }
 

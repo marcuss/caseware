@@ -19,13 +19,14 @@ public interface WorkerListener {
 
     default void taskVerified(VerifyTask task, Duration loadTime) {}
 
-    /** The row needed nothing: it was archived, settled by someone else, or its publish was cancelled. */
+    /** The row needed nothing: it was archived, or another publish had already claimed it. */
     default void taskDropped(VerifyTask task, String reason) {}
 
     /**
-     * The row is still unverified and this worker stopped trying, without a dead letter to replay. Nothing is
-     * scheduled to pick it up before the next publish, so this is the count the design's "unverified under 1%"
-     * objective is measured against.
+     * The row is still unverified and this worker stopped trying. Nothing is scheduled to pick it up before the
+     * next publish of that template, so this is the count the design's "unverified under 1%" objective is
+     * measured against. Usually there is nothing for an operator to replay; the one exception is a dead letter
+     * whose mark the row refused, and the reason says so.
      */
     default void taskAbandoned(VerifyTask task, String reason) {}
 

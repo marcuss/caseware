@@ -13,8 +13,8 @@ public final class DownstreamCapacity {
 
     /**
      * A held slot, tagged with the generation of dispatches it belongs to. A generation ends the moment the limit
-     * changes, which is what lets {@link #shrink} halve once for a whole burst of refusals: the first refusal ends
-     * the generation, and every other slot from it is then stale.
+     * changes, which is what bounds {@link #shrink} to one halving per generation: the first refusal ends the
+     * generation, and every other slot taken in it is then stale.
      */
     public record Slot(int limit, long generation) {}
 
@@ -51,10 +51,12 @@ public final class DownstreamCapacity {
     }
 
     /**
-     * Halves the limit because the engagement system refused or timed out the load this slot was taken for, and
-     * starts a new generation. A slot from an older generation changes nothing, so one busy window costs one
-     * halving, and an operator's {@link #setLimit} is never re-halved by a straggler. Returns the new limit when
-     * this call changed it. The cap never grows on its own: that is the operator's decision.
+     * Halves the limit because the engagement system refused the load this slot was taken for, or timed it out
+     * while the downstream was out, and starts a new generation. A slot from an older generation changes nothing,
+     * so the loads already dispatched at the old limit cost one halving between them and an operator's
+     * {@link #setLimit} is never re-halved by a straggler; a load dispatched at the new limit and refused in turn
+     * does halve again, because that is the downstream saying the limit is still too high. Returns the new limit
+     * when this call changed it. The cap never grows on its own: that is the operator's decision.
      *
      * <p>The slot is not released here. The caller decides when the downstream is actually free of the load, which
      * for a timeout is not yet.

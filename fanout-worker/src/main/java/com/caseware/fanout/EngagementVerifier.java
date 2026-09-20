@@ -22,8 +22,12 @@ final class EngagementVerifier {
     /** The row still needs verifying, but a user event landed during the load, so this answer is out of date. */
     record Superseded(String reason) implements Result {}
 
-    /** The engagement system failed, classified by what that says about trying again. */
-    record Failed(DownstreamFailure.Kind kind, Duration elapsed, Throwable cause) implements Result {}
+    /**
+     * The engagement system failed, classified by what that says about trying again. {@code seqAtLoad} is the
+     * sequence this attempt read before the load, so whatever the worker writes about the failure is guarded by
+     * the same value the verification write would have been.
+     */
+    record Failed(DownstreamFailure.Kind kind, Duration elapsed, long seqAtLoad, Throwable cause) implements Result {}
 
     /** The worker's own projection store failed. Never the engagement's fault, so never the engagement's penalty. */
     record StoreFailed(Throwable cause) implements Result {}
@@ -48,8 +52,8 @@ final class EngagementVerifier {
             return new Dropped("row already " + row.get().verification());
         }
         // The seq this read saw, not the one at enqueue: a row that moved on while it waited its turn still needs
-        // the load, and the write below is guarded by the same fresh seq, so a user who acts during the load
-        // still wins.
+        // the load, and every write about this attempt, the verification below and the dead-letter mark alike, is
+        // guarded by this same fresh seq, so a user who acts during the load still wins.
         long expectedSeq = row.get().seq();
 
         long started = System.nanoTime();
@@ -57,11 +61,11 @@ final class EngagementVerifier {
         try {
             version = engagements.loadEffectiveVersion(task.engagementId());
         } catch (DownstreamFailure failure) {
-            return new Failed(failure.kind(), since(started), failure);
+            return new Failed(failure.kind(), since(started), expectedSeq, failure);
         } catch (RuntimeException unclassified) {
             // The adapter broke its contract by not classifying this. Treat it as retryable: the alternative is to
             // dead-letter a healthy engagement over a bug on our side of the call.
-            return new Failed(DownstreamFailure.Kind.TRANSIENT, since(started),
+            return new Failed(DownstreamFailure.Kind.TRANSIENT, since(started), expectedSeq,
                     new DownstreamFailure(DownstreamFailure.Kind.TRANSIENT, "unclassified failure from the engagement system", unclassified));
         }
         Duration loadTime = since(started);

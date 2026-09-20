@@ -6,31 +6,32 @@ import java.util.function.BiConsumer;
 
 /**
  * The worker's promise about one submitted publish: the outcome arrives once every one of its engagements has
- * settled, and until then the publish can be cancelled. The handle does not know how many engagements that will be
- * when it is made, because the rows are read a page at a time; it completes when the last page has been enqueued
- * and everything enqueued has settled.
+ * settled. The handle does not know how many engagements that will be when it is made, because the rows are read a
+ * page at a time; it completes when the last page has been enqueued and everything enqueued has settled.
  *
- * <p>The outcome fails rather than completes when the worker shut down first, or when it could not record what
- * happened to a row. Both mean the same thing to the caller: do not acknowledge this delivery.
+ * <p>A publish ends exactly one of three ways, and {@code completed} is the flag that makes it exactly one:
+ * {@link #complete} when everything settled and nothing was left unrecorded, the same path completing the outcome
+ * exceptionally when something was, and {@link #fail} when the scan threw or the worker shut down first. All of
+ * them run {@code onFinished}, so the worker always forgets the handle, and the last two mean the same thing to
+ * the caller: do not acknowledge this delivery.
  */
 public final class PublishHandle {
 
-    enum Settlement { VERIFIED, DROPPED, DEAD_LETTERED, UNRECORDED }
+    enum Settlement { VERIFIED, DROPPED, ABANDONED, DEAD_LETTERED, UNRECORDED }
 
     private final PublishId publishId;
     private final BiConsumer<PublishHandle, PublishOutcome> onFinished;
     private final CompletableFuture<PublishOutcome> outcome = new CompletableFuture<>();
     private final Object lock = new Object();
-    private Runnable onCancel = () -> {};
     private int enqueued;
     private int settled;
     private int verified;
     private int dropped;
+    private int abandoned;
     private int deadLettered;
     private int unrecorded;
     private boolean allEnqueued;
     private boolean completed;
-    private volatile boolean cancelled;
 
     /** {@code onFinished} runs before the outcome becomes visible, so the worker can forget the handle first. */
     PublishHandle(PublishId publishId, BiConsumer<PublishHandle, PublishOutcome> onFinished) {
@@ -44,31 +45,6 @@ public final class PublishHandle {
 
     public CompletionStage<PublishOutcome> outcome() {
         return outcome;
-    }
-
-    /**
-     * Operator stop for this publish: queued rows are dropped and no more are read, loads already running finish
-     * and are recorded. A withdrawal is not a reason to call this. The base version this worker establishes is
-     * the same whichever version was withdrawn, and the retarget the design does on a withdrawal needs it known.
-     */
-    public void cancel() {
-        synchronized (lock) {
-            if (cancelled) return;
-            cancelled = true;
-        }
-        onCancel.run();
-    }
-
-    public boolean isCancelled() {
-        return cancelled;
-    }
-
-    /** Runs when the publish is cancelled, so the worker can stop reading pages for it. */
-    void onCancel(Runnable action) {
-        synchronized (lock) {
-            onCancel = action;
-        }
-        if (cancelled) action.run();
     }
 
     /** A page of tasks has been enqueued for this publish. */
@@ -101,6 +77,7 @@ public final class PublishHandle {
             switch (how) {
                 case VERIFIED -> verified++;
                 case DROPPED -> dropped++;
+                case ABANDONED -> abandoned++;
                 case DEAD_LETTERED -> deadLettered++;
                 case UNRECORDED -> unrecorded++;
             }
@@ -110,11 +87,12 @@ public final class PublishHandle {
         if (complete) complete();
     }
 
-    /** Ends the publish without an outcome: the worker stopped, or could not read the rows it still owed. */
-    void abandon(String why) {
-        outcome.completeExceptionally(new IllegalStateException(why));
-    }
-
+    /**
+     * Ends the publish without an outcome: the rows could not be read, or the worker stopped while it still owed
+     * work. Taking {@code completed} here is what stops a settlement arriving afterwards, from a load still in
+     * flight or from an action the timer fires after the shutdown, from completing the publish normally and
+     * telling the adapter to acknowledge a delivery whose rows are still unverified.
+     */
     void fail(Throwable cause) {
         boolean first;
         synchronized (lock) {
@@ -145,7 +123,7 @@ public final class PublishHandle {
 
     private PublishOutcome snapshot() {
         synchronized (lock) {
-            return new PublishOutcome(verified, dropped, deadLettered, cancelled);
+            return new PublishOutcome(verified, dropped, abandoned, deadLettered);
         }
     }
 }
